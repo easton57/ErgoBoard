@@ -14,18 +14,24 @@
  * Note: Pin 34 is INPUT-ONLY and cannot be used as OUTPUT (row pin)
  */
 
+#include <BleKeyboard.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 // #include <Wire.h>  // I2C disabled for right-side-only development
 
-// HID keycode constants for thumb keys
-#define KEY_DELETE    0x2A
-#define KEY_HOME      0x4A
-#define KEY_SPACE     0x2C
-#define KEY_BACKTICK  0x35
-#define KEY_TILDE     0x64
+// Create BLEKeyboard instance
+BleKeyboard bleKeyboard("Right Split Keyboard", "Split Keyboard", 100);
+
+// Special key constants for thumb keys
+// These are NOT HID codes - they're just markers to identify special keys
+// We'll convert them to proper HID codes in asciiToHIDKeycode()
+#define KEY_DELETE    0xF0  // Custom marker for Delete key
+#define KEY_HOME      0xF1  // Custom marker for Home key  
+#define KEY_SPACE     0xF2  // Custom marker for Space key
+#define KEY_BACKTICK  0xF3  // Custom marker for Backtick key
+#define KEY_TILDE     0xF4  // Custom marker for Tilde key
 
 // Matrix dimensions
 const int MAIN_ROWS = 5;
@@ -76,48 +82,20 @@ bool leftModifiers[5] = {false}; // ctrl, shift, alt, super, fn
 // Debounce delay
 const unsigned long DEBOUNCE_DELAY = 5;
 
-// BLE variables
+// BLE variables for left side communication
 BLEServer* pServer = nullptr;
-BLECharacteristic* pInputCharacteristic;
 BLECharacteristic* pDataCharacteristic; // For receiving data from left side
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
-// Track last sent report to detect changes
-uint8_t lastReport[9] = {0};
-bool reportChanged = false;
+// Track last sent keys to detect changes
+char lastKeys[6] = {0};
+uint8_t lastSpecialKeys[6] = {0};
+uint8_t lastModifier = 0;
 
 // Service and characteristic UUIDs for communication
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
 #define CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
-
-// HID Report Descriptor for Keyboard
-uint8_t _hidReportDescriptor[63] = {
-    0x05, 0x01,        // Usage Page (Generic Desktop)
-    0x09, 0x06,        // Usage (Keyboard)
-    0xA1, 0x01,        // Collection (Application)
-    0x85, 0x01,        //   Report ID (1)
-    0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0xE0,        //   Usage Minimum (224)
-    0x29, 0xE7,        //   Usage Maximum (231)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x01,        //   Logical Maximum (1)
-    0x75, 0x01,        //   Report Size (1)
-    0x95, 0x08,        //   Report Count (8)
-    0x81, 0x02,        //   Input (Data, Variable, Absolute)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x01,        //   Input (Constant)
-    0x95, 0x06,        //   Report Count (6)
-    0x75, 0x08,        //   Report Size (8)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x65,        //   Logical Maximum(101)
-    0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0x00,        //   Usage Minimum (0)
-    0x29, 0x65,        //   Usage Maximum (101)
-    0x81, 0x00,        //   Input (Data, Array)
-    0xC0               // End Collection
-};
 
 // KeyData struct for bluetooth communication
 struct KeyData {
@@ -133,20 +111,16 @@ char mapLeftSideKey(int row, int col);
 String getKeyName(char key, int row = -1, int col = -1);
 uint8_t asciiToHIDKeycode(char key);
 
-// BLE Server callbacks
+// BLE Server callbacks for left side communication service
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
-      Serial.println("\n=== BLE device connected (keyboard ready) ===");
-      // Reset last report when connecting
-      memset(lastReport, 0, 9);
+      Serial.println("\n=== Left side ESP32 connected ===");
     }
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
-      Serial.println("\n=== BLE device disconnected ===");
-      // Reset last report when disconnecting
-      memset(lastReport, 0, 9);
+      Serial.println("\n=== Left side ESP32 disconnected ===");
     }
 };
 
@@ -232,34 +206,24 @@ void setup() {
     pinMode(mainColPins[i], INPUT_PULLUP);
   }
   
-  // Initialize BLE
-  BLEDevice::init("Right Split Keyboard");
+  // Initialize BLE Keyboard (this initializes BLEDevice internally)
+  Serial.println("Starting BLE Keyboard...");
+  bleKeyboard.begin();
   
-  // Create the BLE Server
+  // Wait a bit for BLE to initialize
+  delay(500);
+  
+  // Check initial connection status
+  Serial.print("Initial BLE connection status: ");
+  Serial.println(bleKeyboard.isConnected() ? "CONNECTED" : "NOT CONNECTED");
+  
+  // Note: BleKeyboard already initializes BLEDevice, so we need to wait
+  // and then create a separate BLE server for left side communication
+  // Create the BLE Server for left side communication
+  // Note: We can't have two BLE devices with the same name, so we'll use
+  // the existing BLEDevice instance that BleKeyboard created
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
-  
-  // Create HID Service
-  BLEService *pHIDService = pServer->createService(BLEUUID((uint16_t)0x1812));
-  
-  // Create HID Information Characteristic
-  uint8_t hidInfo[] = {0x11, 0x01, 0x00, 0x01}; // HID version 1.11, country code 0, flags 1
-  BLECharacteristic* pHIDInfoCharacteristic = new BLECharacteristic(BLEUUID((uint16_t)0x2A4A), BLECharacteristic::PROPERTY_READ);
-  pHIDInfoCharacteristic->setValue(hidInfo, 4);
-  pHIDService->addCharacteristic(pHIDInfoCharacteristic);
-  
-  // Create Report Map Characteristic
-  BLECharacteristic* pHIDReportMapCharacteristic = new BLECharacteristic(BLEUUID((uint16_t)0x2A4B), BLECharacteristic::PROPERTY_READ);
-  pHIDReportMapCharacteristic->setValue(_hidReportDescriptor, sizeof(_hidReportDescriptor));
-  pHIDService->addCharacteristic(pHIDReportMapCharacteristic);
-  
-  // Create Input Report Characteristic
-  pInputCharacteristic = new BLECharacteristic(BLEUUID((uint16_t)0x2A4D), BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  pInputCharacteristic->addDescriptor(new BLE2902());
-  pHIDService->addCharacteristic(pInputCharacteristic);
-  
-  // Start the service
-  pHIDService->start();
   
   // Create custom service for communication with left side
   BLEService *pCommService = pServer->createService(SERVICE_UUID);
@@ -275,38 +239,31 @@ void setup() {
   // Start the communication service
   pCommService->start();
   
-  // Start advertising
+  // Start advertising for left side communication
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(pHIDService->getUUID());
   pAdvertising->addServiceUUID(pCommService->getUUID());
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
-  pAdvertising->setMinPreferred(0x12);
-  pAdvertising->setMinInterval(0x20);    // Reduce connection interval for better stability
-  pAdvertising->setMaxInterval(0x40);
   BLEDevice::startAdvertising();
   
-  Serial.println("BLE HID Keyboard ready - waiting for connection...");
+  Serial.println("BLE Keyboard ready - waiting for connection...");
   Serial.println("Scan for 'Right Split Keyboard' and connect");
 }
 
 void loop() {
-  // Handle BLE connection state changes first
+  // Handle left side BLE connection state changes
   if (!deviceConnected && oldDeviceConnected) {
-    // Disconnected - give the bluetooth stack time to clean up
     delay(500);
     pServer->startAdvertising();
-    Serial.println("Start advertising");
+    Serial.println("Start advertising for left side");
     oldDeviceConnected = deviceConnected;
   }
   
   if (deviceConnected && !oldDeviceConnected) {
-    // Just connected
     oldDeviceConnected = deviceConnected;
-    Serial.println("Connection established - ready for input");
+    Serial.println("Left side ESP32 connected");
   }
   
-  // Always scan the right side matrix (even without BLE connection for testing)
+  // Always scan the right side matrix
   scanMainMatrix();
   
   // Always check for key state changes (for logging/debugging)
@@ -315,16 +272,31 @@ void loop() {
   // Update right side modifier states
   updateRightModifierStates();
   
-  // Process all keys only if BLE is connected
-  if (deviceConnected) {
-    processAllKeys();
-  } else {
-    // Only print waiting message occasionally to avoid spam
-    static unsigned long lastMessage = 0;
-    if (millis() - lastMessage > 5000) {
-      Serial.println("Waiting for BLE connection... (Right side scanning active)");
-      lastMessage = millis();
+  // Check BLE keyboard connection status
+  // Note: isConnected() may be unreliable, so we'll try sending keys anyway
+  static bool wasConnected = false;
+  bool isConnected = bleKeyboard.isConnected();
+  
+  // Always try to process keys - the connection callback may not be working
+  // but the connection might actually be active
+  processAllKeys();
+  
+  // Still log connection status changes for debugging
+  if (isConnected != wasConnected) {
+    if (isConnected) {
+      Serial.println("\n=== BLE Keyboard CONNECTED (status reported) ===");
+    } else {
+      Serial.println("\n=== BLE Keyboard DISCONNECTED (status reported) ===");
     }
+    wasConnected = isConnected;
+  }
+  
+  // Log status occasionally
+  static unsigned long lastStatusTime = 0;
+  if (millis() - lastStatusTime > 5000) {
+    Serial.print("BLE Status: ");
+    Serial.println(isConnected ? "Reported as CONNECTED" : "Reported as NOT CONNECTED (but trying anyway)");
+    lastStatusTime = millis();
   }
   
   // Small delay to allow BLE stack to process events
@@ -357,13 +329,22 @@ void scanMainMatrix() {
       // Read the column pin (LOW = pressed due to pull-up)
       bool isPressed = (digitalRead(mainColPins[col]) == LOW);
       
-      // Apply debouncing
+      // Apply debouncing - if state changed, verify it's stable
       if (isPressed != lastMainKeyStates[row][col]) {
         delay(DEBOUNCE_DELAY);
-        isPressed = (digitalRead(mainColPins[col]) == LOW);
+        // Read again to verify
+        bool secondRead = (digitalRead(mainColPins[col]) == LOW);
+        // Only accept change if both reads agree
+        if (isPressed == secondRead) {
+          mainKeyStates[row][col] = isPressed;
+        } else {
+          // State not stable, keep previous state
+          mainKeyStates[row][col] = lastMainKeyStates[row][col];
+        }
+      } else {
+        // State unchanged, use current reading
+        mainKeyStates[row][col] = isPressed;
       }
-      
-      mainKeyStates[row][col] = isPressed;
     }
     
     // Set row back to HIGH before moving to next row
@@ -443,9 +424,8 @@ void updateRightModifierStates() {
 }
 
 void processAllKeys() {
-  // Build HID keyboard report
+  // Build modifier byte
   uint8_t modifier = 0x00;
-  uint8_t keys[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   
   // Process left side modifiers
   if (leftModifiers[0]) modifier |= 0x01; // Left Ctrl
@@ -459,17 +439,35 @@ void processAllKeys() {
   if (rightAltPressed) modifier |= 0x40;   // Right Alt
   if (rightSuperPressed) modifier |= 0x80; // Right GUI/Super
   
-  // Process left side main keys (only send if not modifiers)
+  // Collect all pressed keys (store as chars for BleKeyboard, special keys as HID codes)
+  char keys[6] = {0, 0, 0, 0, 0, 0};
+  uint8_t specialKeys[6] = {0, 0, 0, 0, 0, 0}; // For special keys that need HID codes
   int keyIndex = 0;
+  int specialIndex = 0;
+  
+  // Process left side main keys
   for (int row = 0; row < 4; row++) {
     for (int col = 0; col < 6; col++) {
       if (leftMainKeyStates[row][col] && keyIndex < 6) {
-        // Map left side keys to appropriate characters
         char key = mapLeftSideKey(row, col);
         if (key != 0) {
-          uint8_t hidKeycode = asciiToHIDKeycode(key);
-          if (hidKeycode != 0) {
-            keys[keyIndex++] = hidKeycode;
+          // Check for special keys first (before ASCII check)
+          if (key == KEY_DELETE || key == KEY_HOME || key == KEY_SPACE || 
+              key == KEY_BACKTICK || key == KEY_TILDE) {
+            // Special key - convert to HID keycode
+            uint8_t hidKeycode = asciiToHIDKeycode(key);
+            if (hidKeycode != 0 && specialIndex < 6) {
+              specialKeys[specialIndex++] = hidKeycode;
+            }
+          } else if (key >= 0x20 && key <= 0x7E) {
+            // Regular ASCII character
+            keys[keyIndex++] = key;
+          } else {
+            // Other special key
+            uint8_t hidKeycode = asciiToHIDKeycode(key);
+            if (hidKeycode != 0 && specialIndex < 6) {
+              specialKeys[specialIndex++] = hidKeycode;
+            }
           }
         }
       }
@@ -479,99 +477,225 @@ void processAllKeys() {
   // Process right side main keys (rows 0-3)
   for (int row = 0; row < MAIN_ROWS - 1; row++) {
     for (int col = 0; col < MAIN_COLS; col++) {
-      if (keyIndex >= 6) break; // Maximum 6 keys in HID report
+      if (keyIndex >= 6) break;
       
       char key = mainKeyMap[row][col];
-      
-      // Skip empty keys
-      if (key == 0) {
-        continue;
-      }
+      if (key == 0) continue;
       
       if (mainKeyStates[row][col]) {
-        uint8_t hidKeycode = asciiToHIDKeycode(key);
-        if (hidKeycode != 0) {
-          keys[keyIndex++] = hidKeycode;
+        // Check if shift is pressed and use modifier map
+        char keyToSend = key;
+        if (leftModifiers[1]) { // Shift is pressed
+          char modifierKey = mainModifierMap[row][col];
+          if (modifierKey != 0) {
+            keyToSend = modifierKey;
+          }
+        }
+        
+        // Check for special keys first (before ASCII check)
+        if (keyToSend == KEY_DELETE || keyToSend == KEY_HOME || keyToSend == KEY_BACKTICK || keyToSend == KEY_TILDE) {
+          // Special key - convert to HID keycode
+          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
+          if (hidKeycode != 0 && specialIndex < 6) {
+            specialKeys[specialIndex++] = hidKeycode;
+          }
+        } else if (keyToSend >= 0x20 && keyToSend <= 0x7E) {
+          // Regular ASCII character
+          keys[keyIndex++] = keyToSend;
+        } else {
+          // Other special key
+          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
+          if (hidKeycode != 0 && specialIndex < 6) {
+            specialKeys[specialIndex++] = hidKeycode;
+          }
         }
       }
     }
-    if (keyIndex >= 6) break; // Exit outer loop if full
+    if (keyIndex >= 6) break;
   }
   
   // Process thumb cluster (row 4)
-  if (keyIndex < 6) {
+  if (keyIndex < 6 || specialIndex < 6) {
     for (int col = 0; col < MAIN_COLS; col++) {
-      if (keyIndex >= 6) break;
+      if (keyIndex >= 6 && specialIndex >= 6) break;
       
       char key = mainKeyMap[4][col];
-      
-      // Skip empty keys
-      if (key == 0 || key == ' ') {
-        continue;
-      }
+      if (key == 0 || key == ' ') continue;
       
       if (mainKeyStates[4][col]) {
-        uint8_t hidKeycode = asciiToHIDKeycode(key);
-        if (hidKeycode != 0) {
-          keys[keyIndex++] = hidKeycode;
-        }
-      }
-    }
-  }
-  
-  // Build HID report (Report ID + Modifier + Reserved + 6 keycodes)
-  uint8_t report[9] = {0x01, modifier, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]};
-  
-  // Check if report has changed
-  reportChanged = false;
-  for (int i = 0; i < 9; i++) {
-    if (report[i] != lastReport[i]) {
-      reportChanged = true;
-      break;
-    }
-  }
-  
-  // Always send report if changed, and send empty report periodically to maintain connection
-  static unsigned long lastReportTime = 0;
-  bool shouldSend = reportChanged;
-  
-  // Send empty report every 50ms when no keys pressed to maintain connection
-  // This prevents the host from thinking the keyboard disconnected
-  if (!reportChanged) {
-    if (millis() - lastReportTime > 50) {
-      shouldSend = true;
-      lastReportTime = millis();
-    }
-  } else {
-    lastReportTime = millis();
-  }
-  
-  if (shouldSend) {
-    // Send the report
-    pInputCharacteristic->setValue(report, 9);
-    pInputCharacteristic->notify();
-    
-    // Debug: print report details (only when keys are actually pressed)
-    if (reportChanged) {
-      static unsigned long lastDebugTime = 0;
-      if (millis() - lastDebugTime > 100) { // Limit debug output
-        Serial.print("HID Report: Mod=");
-        Serial.print(modifier, HEX);
-        Serial.print(" Keys=[");
-        for (int i = 0; i < 6; i++) {
-          if (keys[i] != 0) {
-            Serial.print("0x");
-            Serial.print(keys[i], HEX);
-            Serial.print(" ");
+        // Check if shift is pressed and use modifier map
+        // NOTE: This requires the left ESP32 to be connected and sending shift state
+        // via leftModifiers[1]. Until then, modifier map won't be applied.
+        char keyToSend = key;
+        if (leftModifiers[1]) { // Shift is pressed (from left ESP32)
+          char modifierKey = mainModifierMap[4][col];
+          if (modifierKey != 0 && modifierKey != KEY_DELETE && modifierKey != KEY_HOME && modifierKey != KEY_SPACE) {
+            keyToSend = modifierKey;
           }
         }
-        Serial.println("]");
-        lastDebugTime = millis();
+        
+        // Check for special keys first (before ASCII check)
+        // Note: These constants may overlap with ASCII, so check them specifically
+        if (keyToSend == KEY_SPACE) {
+          // Space key - send as ASCII space character ' ' (0x20)
+          // BleKeyboard will handle the conversion to HID 0x2C
+          if (keyIndex < 6) keys[keyIndex++] = ' ';
+        } else if (keyToSend == KEY_DELETE || keyToSend == KEY_HOME || keyToSend == KEY_BACKTICK || keyToSend == KEY_TILDE) {
+          // Special key - convert to HID keycode
+          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
+          if (hidKeycode != 0 && specialIndex < 6) {
+            specialKeys[specialIndex++] = hidKeycode;
+          }
+        } else if (keyToSend >= 0x20 && keyToSend <= 0x7E) {
+          // Regular ASCII character
+          if (keyIndex < 6) keys[keyIndex++] = keyToSend;
+        } else {
+          // Other special key
+          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
+          if (hidKeycode != 0 && specialIndex < 6) {
+            specialKeys[specialIndex++] = hidKeycode;
+          }
+        }
+      }
+    }
+  }
+  
+  // Check if anything changed
+  bool changed = (modifier != lastModifier);
+  if (!changed) {
+    for (int i = 0; i < 6; i++) {
+      if (keys[i] != lastKeys[i] || specialKeys[i] != lastSpecialKeys[i]) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  
+  // Only send if changed
+  if (changed) {
+    // Release keys that are no longer pressed
+    for (int i = 0; i < 6; i++) {
+      if (lastKeys[i] != 0) {
+        // Check if this key is still in the current keys array
+        bool stillPressed = false;
+        for (int j = 0; j < 6; j++) {
+          if (keys[j] == lastKeys[i]) {
+            stillPressed = true;
+            break;
+          }
+        }
+        if (!stillPressed) {
+          // Key was released, release it
+          bleKeyboard.release(lastKeys[i]);
+        }
       }
     }
     
-    // Copy to last report
-    memcpy(lastReport, report, 9);
+    // Release special keys that are no longer pressed
+    for (int i = 0; i < 6; i++) {
+      if (lastSpecialKeys[i] != 0) {
+        // Check if this key is still in the current specialKeys array
+        bool stillPressed = false;
+        for (int j = 0; j < 6; j++) {
+          if (specialKeys[j] == lastSpecialKeys[i]) {
+            stillPressed = true;
+            break;
+          }
+        }
+        if (!stillPressed) {
+          // Key was released, release it
+          bleKeyboard.release(lastSpecialKeys[i]);
+        }
+      }
+    }
+    
+    // Small delay to ensure releases are sent
+    delay(5);
+    
+    // Note: We DON'T manually set shift modifier here because:
+    // 1. For regular ASCII keys, BleKeyboard will automatically add shift for uppercase
+    // 2. For modifier map characters like '@' and '~', we want to send them directly
+    //    without shift modifier, as they're already the shifted characters
+    
+    // Press new keys that weren't previously pressed
+    for (int i = 0; i < 6; i++) {
+      if (keys[i] != 0) {
+        // Check if this key was already pressed
+        bool wasPressed = false;
+        for (int j = 0; j < 6; j++) {
+          if (lastKeys[j] == keys[i]) {
+            wasPressed = true;
+            break;
+          }
+        }
+        if (!wasPressed) {
+          // New key pressed
+          bleKeyboard.press(keys[i]);
+        }
+      }
+    }
+    
+    // Press new special keys that weren't previously pressed
+    for (int i = 0; i < 6; i++) {
+      if (specialKeys[i] != 0) {
+        // Check if this key was already pressed
+        bool wasPressed = false;
+        for (int j = 0; j < 6; j++) {
+          if (lastSpecialKeys[j] == specialKeys[i]) {
+            wasPressed = true;
+            break;
+          }
+        }
+        if (!wasPressed) {
+          // New key pressed
+          bleKeyboard.press(specialKeys[i]);
+        }
+      }
+    }
+    
+    // Debug output
+    static unsigned long lastDebugTime = 0;
+    if (millis() - lastDebugTime > 100) {
+      Serial.print("SENDING Keys: Mod=0x");
+      Serial.print(modifier, HEX);
+      Serial.print(" ASCII=[");
+      for (int i = 0; i < 6; i++) {
+        if (keys[i] != 0) {
+          Serial.print("'");
+          Serial.print((char)keys[i]);
+          Serial.print("' ");
+        }
+      }
+      Serial.print("] HID=[");
+      for (int i = 0; i < 6; i++) {
+        if (specialKeys[i] != 0) {
+          Serial.print("0x");
+          Serial.print(specialKeys[i], HEX);
+          Serial.print(" ");
+        }
+      }
+      Serial.println("]");
+      lastDebugTime = millis();
+    }
+    
+    // Save state
+    lastModifier = modifier;
+    memcpy(lastKeys, keys, 6);
+    memcpy(lastSpecialKeys, specialKeys, 6);
+  } else if (modifier == 0 && keys[0] == 0 && specialKeys[0] == 0) {
+    // No keys pressed - make sure we release everything
+    static unsigned long lastReleaseCheck = 0;
+    if (millis() - lastReleaseCheck > 100) {
+      // Check if we need to release (in case something got stuck)
+      if (lastModifier != 0 || lastKeys[0] != 0 || lastSpecialKeys[0] != 0) {
+        bleKeyboard.releaseAll();
+        lastModifier = 0;
+        memset(lastKeys, 0, 6);
+        memset(lastSpecialKeys, 0, 6);
+        Serial.println("Released all keys (idle state)");
+      }
+      lastReleaseCheck = millis();
+    }
   }
 }
 
@@ -619,14 +743,23 @@ String getKeyName(char key, int row, int col) {
 
 // Convert ASCII character to HID keycode
 uint8_t asciiToHIDKeycode(char key) {
-  // Handle special HID keycodes that are already in HID format
-  if (key == 0x29) return 0x29; // ESC
-  if (key == 0x2B) return 0x2B; // TAB
-  if (key == KEY_DELETE) return 0x4C; // Delete (Backspace in HID)
-  if (key == KEY_HOME) return 0x4A; // Home
-  if (key == KEY_SPACE) return 0x2C; // Space
-  if (key == KEY_BACKTICK) return 0x35; // Backtick/Grave
+  // Handle special keys - use BleKeyboard library constants
+  // These checks must come BEFORE ASCII range checks since the constants
+  // overlap with ASCII values
+  if (key == KEY_DELETE) return KEY_BACKSPACE; // Delete key sends backspace (0xB2)
+  if (key == KEY_HOME) return KEY_LEFT_GUI; // Home key sends Windows/GUI/Super key (0x83)
+  if (key == KEY_SPACE) {
+    // KEY_SPACE is 0xF2, but we need to send the actual space HID code
+    // Space ' ' (0x20) maps to 0x2C in HID, but we should pass ' ' to bleKeyboard
+    // So return 0 to indicate we should handle it as ASCII space instead
+    return 0; // Will be handled as ASCII space character
+  }
+  if (key == KEY_BACKTICK) return 0x35; // Backtick/Grave (0x35 is correct)
   if (key == KEY_TILDE) return 0x35; // Tilde (same as backtick with shift)
+  
+  // Handle other special keys
+  if (key == 0x29) return KEY_ESC; // ESC using BleKeyboard constant
+  if (key == 0x2B) return KEY_TAB; // TAB using BleKeyboard constant
   
   // Convert lowercase letters (a-z) to HID keycodes
   if (key >= 'a' && key <= 'z') {
