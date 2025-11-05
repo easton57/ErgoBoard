@@ -16,7 +16,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <Wire.h>
+//#include <Wire.h>
 
 // Matrix dimensions
 const int MAIN_ROWS = 5;
@@ -26,22 +26,24 @@ const int MAIN_COLS = 6;
 const int mainRowPins[MAIN_ROWS] = {12, 5, 4, 3, 2};
 const int mainColPins[MAIN_COLS] = {11, 10, 9, 8, 7, 6};
 
-// Key matrix - define your keys here
+// Key matrix - define your keys here (for debug output only)
+// Note: The right ESP32 maps these positions using mapLeftSideKey()
+// This map is only used for debug messages on the left side
 const char mainKeyMap[MAIN_ROWS][MAIN_COLS] = {
-  {'esc', '1', '2', '3', '4', '5'},
-  {'tab', 'q', 'w', 'e', 'r', 't'},
-  {'super', 'a', 's', 'd', 'f', 'g'},
-  {'shift', 'z', 'x', 'c', 'v', 'b'},
-  {'ctrl', 'alt', 'fn', ']', '[', '\ '}
+  {KEY_ESC, '1', '2', '3', '4', '5'},        // ESC key (0x29), 1, 2, 3, 4, 5
+  {KEY_TAB, 'q', 'w', 'e', 'r', 't'},        // TAB key (0x2B), q, w, e, r, t
+  {0, 'a', 's', 'd', 'f', 'g'},           // super (handled as modifier), a, s, d, f, g
+  {KEY_LEFT_SHIFT, 'z', 'x', 'c', 'v', 'b'},           // shift (handled as modifier), z, x, c, v, b
+  {0, ']', '[', KEY_ENTER, KEY_HOME, KEY_SPACE}               // ctrl, alt, fn (handled as modifiers), ], [, \
 };
 
 // Modifier key mapping - these need special handling
 const int mainModifierMap[MAIN_ROWS][MAIN_COLS] = {
-  {0, 0, 0, 0, 0, 0},           // esc, 1, 2, 3, 4, 5
-  {0, 0, 0, 0, 0, 0},           // tab, q, w, e, r, t
-  {0, 0, 0, 0, 0, 0},           // super, a, s, d, f, g
-  {0, 0, 0, 0, 0, 0},           // shift, z, x, c, v, b
-  {0, 0, 0, 0, 0, 0}            // ctrl, alt, fn, ], [
+  {KEY_ESC, '!', '@', '#', '$', '%'},           // esc, 1, 2, 3, 4, 5
+  {KEY_TAB, 'Q', 'W', 'E', 'R', 'T'},           // tab, q, w, e, r, t
+  {0, 'A', 'S', 'D', 'F', 'G'},           // super, a, s, d, f, g
+  {KEY_LEFT_SHIFT, 'Z', 'X', 'C', 'V', 'B'},           // shift, z, x, c, v, b
+  {0, '}', '{', KEY_ENTER, KEY_HOME, KEY_SPACE}            // ctrl, alt, fn, ], [
 };
 
 // Modifier key definitions
@@ -231,6 +233,16 @@ void loop() {
 void scanMainMatrix() {
   // Scan each row
   for (int row = 0; row < MAIN_ROWS; row++) {
+    // Ensure all other rows are HIGH before scanning
+    for (int i = 0; i < MAIN_ROWS; i++) {
+      if (i != row) {
+        digitalWrite(mainRowPins[i], HIGH);
+      }
+    }
+    
+    // Small delay for signal stability
+    delayMicroseconds(5);
+    
     // Set current row to LOW
     digitalWrite(mainRowPins[row], LOW);
     
@@ -242,17 +254,29 @@ void scanMainMatrix() {
       // Read the column pin (LOW = pressed due to pull-up)
       bool isPressed = (digitalRead(mainColPins[col]) == LOW);
       
-      // Apply debouncing
+      // Apply debouncing - if state changed, verify it's stable
       if (isPressed != lastMainKeyStates[row][col]) {
         delay(DEBOUNCE_DELAY);
-        isPressed = (digitalRead(mainColPins[col]) == LOW);
+        // Read again to verify
+        bool secondRead = (digitalRead(mainColPins[col]) == LOW);
+        // Only accept change if both reads agree
+        if (isPressed == secondRead) {
+          mainKeyStates[row][col] = isPressed;
+        } else {
+          // State not stable, keep previous state
+          mainKeyStates[row][col] = lastMainKeyStates[row][col];
+        }
+      } else {
+        // State unchanged, use current reading
+        mainKeyStates[row][col] = isPressed;
       }
-      
-      mainKeyStates[row][col] = isPressed;
     }
     
-    // Set row back to HIGH
+    // Set row back to HIGH before moving to next row
     digitalWrite(mainRowPins[row], HIGH);
+    
+    // Small delay to ensure row pin is fully HIGH
+    delayMicroseconds(5);
   }
 }
 
