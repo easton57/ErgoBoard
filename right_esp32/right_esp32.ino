@@ -1,28 +1,31 @@
 /*
  * Split Keyboard - Right Side (ESP32)
+ * Slave to Raspberry Pi 4 (Wireless via Bluetooth)
  * Main cluster: 5 rows × 6 columns (includes thumb cluster on row 4)
+ * 
+ * Architecture:
+ *   - Left side: Raspberry Pi (handles left side keys)
+ *   - Right side: ESP32 (this device, handles right side keys)
+ *   - ESP32 sends right side key data to Raspberry Pi via BLE
+ *   - Raspberry Pi combines both sides and sends to system
  * 
  * Pin Configuration:
  * Main Matrix:
  *   Rows (Outputs): 2, 4, 5, 18 (main), 19 (thumb cluster)
  *   Columns (Inputs): 23, 27, 26, 25, 33, 32 (avoiding I2C pins 21, 22)
  * 
- * I2C Communication: DISABLED for right-side-only development
- *   SDA: 21 (I2C0 SDA - default ESP32 I2C)
- *   SCL: 22 (I2C0 SCL - default ESP32 I2C)
+ * BLE Communication:
+ *   - BLE Client: Sends right side key data to Raspberry Pi 4
  *   
  * Note: Pin 34 is INPUT-ONLY and cannot be used as OUTPUT (row pin)
  */
 
-#include <BleKeyboard.h>
 #include <BLEDevice.h>
-#include <BLEServer.h>
+#include <BLEClient.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-// #include <Wire.h>  // I2C disabled for right-side-only development
-
-// Create BLEKeyboard instance
-BleKeyboard bleKeyboard("Right Split Keyboard", "Split Keyboard", 100);
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
 // Special key constants for thumb keys
 // These are NOT HID codes - they're just markers to identify special keys
@@ -75,125 +78,81 @@ bool rightAltPressed = false;
 bool rightSuperPressed = false;
 bool rightFnPressed = false;
 
-// Left side key states (received via I2C)
-bool leftMainKeyStates[4][6] = {false};
-bool leftModifiers[5] = {false}; // ctrl, shift, alt, super, fn
-
 // Debounce delay
 const unsigned long DEBOUNCE_DELAY = 5;
 
-// BLE variables for left side communication
-BLEServer* pServer = nullptr;
-BLECharacteristic* pDataCharacteristic; // For receiving data from left side
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+// BLE variables for Raspberry Pi communication (BLE Client)
+BLEClient* pRPiClient = nullptr;
+BLERemoteCharacteristic* pRPiCharacteristic = nullptr;
+bool rpiConnected = false;
+bool doRPiConnect = false;
+bool doRPiScan = false;
+BLEAddress* pRPiServerAddress = nullptr;
 
-// Track last sent keys to detect changes
-char lastKeys[6] = {0};
-uint8_t lastSpecialKeys[6] = {0};
-uint8_t lastModifier = 0;
+// Service and characteristic UUIDs for communication with Raspberry Pi 4
+#define RPI_SERVICE_UUID        "abcd1234-5678-90ef-1234-567890abcdef"
+#define RPI_CHARACTERISTIC_UUID "fedc9876-5432-10fe-dcba-9876543210fe"
 
-// Service and characteristic UUIDs for communication
-#define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
-#define CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
-
-// KeyData struct for bluetooth communication
-struct KeyData {
-  bool mainKeys[4][6];
-  bool modifiers[5];  // ctrl, shift, alt, super, fn
+// KeyData struct for sending to Raspberry Pi
+// Format: JSON-like string sent via BLE
+// Example: {"keys":[[0,0,0,0,0,0],...],"mods":[0,0,0,0,0],"ts":12345}
+struct KeyDataForRPi {
+  bool keys[MAIN_ROWS][MAIN_COLS];
+  bool mods[5];  // ctrl, shift, alt, super, fn
   unsigned long timestamp;
 };
 
-KeyData leftKeyData;
+KeyDataForRPi keyDataForRPi;
 
 // Forward declarations
-char mapLeftSideKey(int row, int col);
 String getKeyName(char key, int row = -1, int col = -1);
 uint8_t asciiToHIDKeycode(char key);
+void sendKeyDataToRPi();
+String serializeKeyDataToJSON();
+bool connectToRPi();
 
-// BLE Server callbacks for left side communication service
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-      Serial.println("\n=== Left side ESP32 connected ===");
-    }
+// BLE Client callbacks for Raspberry Pi connection
+class MyRPiClientCallback: public BLEClientCallbacks {
+  void onConnect(BLEClient* pClient) {
+    Serial.println("\n=== Connected to Raspberry Pi 4 ===");
+    rpiConnected = true;
+  }
 
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-      Serial.println("\n=== Left side ESP32 disconnected ===");
-    }
+  void onDisconnect(BLEClient* pClient) {
+    Serial.println("\n=== Disconnected from Raspberry Pi 4 ===");
+    rpiConnected = false;
+    doRPiScan = true;
+  }
 };
 
-// BLE Characteristic callbacks for receiving data from left side
-class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-      String rxValue = pCharacteristic->getValue();
-      
-      if (rxValue.length() == sizeof(KeyData)) {
-        // Copy received data to leftKeyData
-        memcpy(&leftKeyData, rxValue.c_str(), sizeof(KeyData));
-        
-        // Update left side key states
-        for (int row = 0; row < 4; row++) {
-          for (int col = 0; col < 6; col++) {
-            bool wasPressed = leftMainKeyStates[row][col];
-            leftMainKeyStates[row][col] = leftKeyData.mainKeys[row][col];
+// BLE Advertised Device callbacks for finding Raspberry Pi
+class MyRPiAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+        Serial.print("BLE Advertised Device found: ");
+        Serial.println(advertisedDevice.toString().c_str());
+
+        // Check if this is our Raspberry Pi 4
+        if (advertisedDevice.haveServiceUUID() && 
+            advertisedDevice.isAdvertisingService(BLEUUID(RPI_SERVICE_UUID))) {
             
-            // Debug: Print left side key changes
-            if (leftMainKeyStates[row][col] && !wasPressed) {
-              Serial.print("Left Key PRESSED: Row ");
-              Serial.print(row);
-              Serial.print(", Col ");
-              Serial.print(col);
-              Serial.print(" -> ");
-              Serial.println(mapLeftSideKey(row, col));
-            } else if (!leftMainKeyStates[row][col] && wasPressed) {
-              Serial.print("Left Key RELEASED: Row ");
-              Serial.print(row);
-              Serial.print(", Col ");
-              Serial.print(col);
-              Serial.print(" -> ");
-              Serial.println(mapLeftSideKey(row, col));
-            }
-          }
+            BLEDevice::getScan()->stop();
+            pRPiServerAddress = new BLEAddress(advertisedDevice.getAddress());
+            doRPiConnect = true;
+            doRPiScan = false;
+            Serial.println("Found Raspberry Pi 4!");
         }
-        
-        // Update left side modifier states
-        for (int i = 0; i < 5; i++) {
-          bool wasActive = leftModifiers[i];
-          leftModifiers[i] = leftKeyData.modifiers[i];
-          
-          // Debug: Print modifier changes
-          if (leftModifiers[i] && !wasActive) {
-            Serial.print("Left Modifier ACTIVATED: ");
-            switch(i) {
-              case 0: Serial.println("Ctrl"); break;
-              case 1: Serial.println("Shift"); break;
-              case 2: Serial.println("Alt"); break;
-              case 3: Serial.println("Super/GUI"); break;
-              case 4: Serial.println("Fn"); break;
-            }
-          } else if (!leftModifiers[i] && wasActive) {
-            Serial.print("Left Modifier DEACTIVATED: ");
-            switch(i) {
-              case 0: Serial.println("Ctrl"); break;
-              case 1: Serial.println("Shift"); break;
-              case 2: Serial.println("Alt"); break;
-              case 3: Serial.println("Super/GUI"); break;
-              case 4: Serial.println("Fn"); break;
-            }
-          }
-        }
-      }
     }
 };
+
 
 void setup() {
-  // Debug output (must be first for early debugging)
+  // Initialize Serial for debugging
   Serial.begin(115200);
   delay(1000); // Give serial time to initialize
-  Serial.println("\n\nRight Split Keyboard - ESP32");
+  
+  Serial.println("\n\nRight Split Keyboard - ESP32 (RPi Slave - Wireless)");
   Serial.println("Main: 5 rows × 6 columns");
+  Serial.println("Communication: BLE to RPi 4 (wireless)");
   
   // Initialize main matrix row pins as outputs
   for (int i = 0; i < MAIN_ROWS; i++) {
@@ -206,61 +165,39 @@ void setup() {
     pinMode(mainColPins[i], INPUT_PULLUP);
   }
   
-  // Initialize BLE Keyboard (this initializes BLEDevice internally)
-  Serial.println("Starting BLE Keyboard...");
-  bleKeyboard.begin();
+  // Initialize BLE
+  BLEDevice::init("Right Split Keyboard");
   
-  // Wait a bit for BLE to initialize
-  delay(500);
+  // Create BLE client for Raspberry Pi communication
+  pRPiClient = BLEDevice::createClient();
+  pRPiClient->setClientCallbacks(new MyRPiClientCallback());
   
-  // Check initial connection status
-  Serial.print("Initial BLE connection status: ");
-  Serial.println(bleKeyboard.isConnected() ? "CONNECTED" : "NOT CONNECTED");
+  // Start scanning for Raspberry Pi 4
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyRPiAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(5, false);
   
-  // Note: BleKeyboard already initializes BLEDevice, so we need to wait
-  // and then create a separate BLE server for left side communication
-  // Create the BLE Server for left side communication
-  // Note: We can't have two BLE devices with the same name, so we'll use
-  // the existing BLEDevice instance that BleKeyboard created
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-  
-  // Create custom service for communication with left side
-  BLEService *pCommService = pServer->createService(SERVICE_UUID);
-  
-  // Create characteristic for receiving data from left side
-  pDataCharacteristic = pCommService->createCharacteristic(
-                         CHARACTERISTIC_UUID,
-                         BLECharacteristic::PROPERTY_READ |
-                         BLECharacteristic::PROPERTY_WRITE
-                       );
-  pDataCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
-  
-  // Start the communication service
-  pCommService->start();
-  
-  // Start advertising for left side communication
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(pCommService->getUUID());
-  pAdvertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
-  
-  Serial.println("BLE Keyboard ready - waiting for connection...");
-  Serial.println("Scan for 'Right Split Keyboard' and connect");
+  Serial.println("Scanning for Raspberry Pi 4...");
 }
 
 void loop() {
-  // Handle left side BLE connection state changes
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(500);
-    pServer->startAdvertising();
-    Serial.println("Start advertising for left side");
-    oldDeviceConnected = deviceConnected;
+  // Handle Raspberry Pi BLE connection
+  if (doRPiConnect == true) {
+    if (connectToRPi()) {
+      Serial.println("Connected to Raspberry Pi 4!");
+    } else {
+      Serial.println("Failed to connect to Raspberry Pi 4");
+    }
+    doRPiConnect = false;
   }
   
-  if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = deviceConnected;
-    Serial.println("Left side ESP32 connected");
+  // If disconnected from RPi, restart scanning
+  if (!rpiConnected && doRPiScan) {
+    BLEDevice::getScan()->start(0);
+    doRPiScan = false;
   }
   
   // Always scan the right side matrix
@@ -272,31 +209,9 @@ void loop() {
   // Update right side modifier states
   updateRightModifierStates();
   
-  // Check BLE keyboard connection status
-  // Note: isConnected() may be unreliable, so we'll try sending keys anyway
-  static bool wasConnected = false;
-  bool isConnected = bleKeyboard.isConnected();
-  
-  // Always try to process keys - the connection callback may not be working
-  // but the connection might actually be active
-  processAllKeys();
-  
-  // Still log connection status changes for debugging
-  if (isConnected != wasConnected) {
-    if (isConnected) {
-      Serial.println("\n=== BLE Keyboard CONNECTED (status reported) ===");
-    } else {
-      Serial.println("\n=== BLE Keyboard DISCONNECTED (status reported) ===");
-    }
-    wasConnected = isConnected;
-  }
-  
-  // Log status occasionally
-  static unsigned long lastStatusTime = 0;
-  if (millis() - lastStatusTime > 5000) {
-    Serial.print("BLE Status: ");
-    Serial.println(isConnected ? "Reported as CONNECTED" : "Reported as NOT CONNECTED (but trying anyway)");
-    lastStatusTime = millis();
+  // Prepare and send key data to Raspberry Pi (only if connected)
+  if (rpiConnected) {
+    sendKeyDataToRPi();
   }
   
   // Small delay to allow BLE stack to process events
@@ -423,280 +338,100 @@ void updateRightModifierStates() {
   rightFnPressed = false;
 }
 
-void processAllKeys() {
-  // Build modifier byte
-  uint8_t modifier = 0x00;
-  
-  // Process left side modifiers
-  if (leftModifiers[0]) modifier |= 0x01; // Left Ctrl
-  if (leftModifiers[1]) modifier |= 0x02; // Left Shift
-  if (leftModifiers[2]) modifier |= 0x04; // Left Alt
-  if (leftModifiers[3]) modifier |= 0x08; // Left GUI/Super
-  
-  // Process right side modifiers
-  if (rightCtrlPressed) modifier |= 0x10;  // Right Ctrl
-  if (rightShiftPressed) modifier |= 0x20; // Right Shift
-  if (rightAltPressed) modifier |= 0x40;   // Right Alt
-  if (rightSuperPressed) modifier |= 0x80; // Right GUI/Super
-  
-  // Collect all pressed keys (store as chars for BleKeyboard, special keys as HID codes)
-  char keys[6] = {0, 0, 0, 0, 0, 0};
-  uint8_t specialKeys[6] = {0, 0, 0, 0, 0, 0}; // For special keys that need HID codes
-  int keyIndex = 0;
-  int specialIndex = 0;
-  
-  // Process left side main keys
-  for (int row = 0; row < 4; row++) {
-    for (int col = 0; col < 6; col++) {
-      if (leftMainKeyStates[row][col] && keyIndex < 6) {
-        char key = mapLeftSideKey(row, col);
-        if (key != 0) {
-          // Check for special keys first (before ASCII check)
-          if (key == KEY_DELETE || key == KEY_HOME || key == KEY_SPACE || 
-              key == KEY_BACKTICK || key == KEY_TILDE) {
-            // Special key - convert to HID keycode
-            uint8_t hidKeycode = asciiToHIDKeycode(key);
-            if (hidKeycode != 0 && specialIndex < 6) {
-              specialKeys[specialIndex++] = hidKeycode;
-            }
-          } else if (key >= 0x20 && key <= 0x7E) {
-            // Regular ASCII character
-            keys[keyIndex++] = key;
-          } else {
-            // Other special key
-            uint8_t hidKeycode = asciiToHIDKeycode(key);
-            if (hidKeycode != 0 && specialIndex < 6) {
-              specialKeys[specialIndex++] = hidKeycode;
-            }
-          }
-        }
-      }
+// Connect to the Raspberry Pi 4 BLE server
+bool connectToRPi() {
+    if (pRPiServerAddress == nullptr) {
+      Serial.println("No RPi server address available");
+      return false;
     }
-  }
-  
-  // Process right side main keys (rows 0-3)
-  for (int row = 0; row < MAIN_ROWS - 1; row++) {
+    
+    Serial.print("Forming a connection to ");
+    Serial.println(pRPiServerAddress->toString().c_str());
+    
+    pRPiClient->connect(*pRPiServerAddress);
+    Serial.println(" - Connected to RPi server");
+
+    // Obtain a reference to the service we are after in the remote BLE server.
+    BLERemoteService* pRemoteService = pRPiClient->getService(RPI_SERVICE_UUID);
+    if (pRemoteService == nullptr) {
+      Serial.print("Failed to find RPi service UUID: ");
+      Serial.println(RPI_SERVICE_UUID);
+      pRPiClient->disconnect();
+      return false;
+    }
+    Serial.println(" - Found RPi service");
+
+    // Obtain a reference to the characteristic in the service of the remote BLE server.
+    pRPiCharacteristic = pRemoteService->getCharacteristic(RPI_CHARACTERISTIC_UUID);
+    if (pRPiCharacteristic == nullptr) {
+      Serial.print("Failed to find RPi characteristic UUID: ");
+      Serial.println(RPI_CHARACTERISTIC_UUID);
+      pRPiClient->disconnect();
+      return false;
+    }
+    Serial.println(" - Found RPi characteristic");
+
+    return true;
+}
+
+// Prepare and send key data to Raspberry Pi via BLE
+void sendKeyDataToRPi() {
+  // Update the key data structure
+  // Copy right side key states
+  for (int row = 0; row < MAIN_ROWS; row++) {
     for (int col = 0; col < MAIN_COLS; col++) {
-      if (keyIndex >= 6) break;
-      
-      char key = mainKeyMap[row][col];
-      if (key == 0) continue;
-      
-      if (mainKeyStates[row][col]) {
-        // Check if shift is pressed and use modifier map
-        char keyToSend = key;
-        if (leftModifiers[1]) { // Shift is pressed
-          char modifierKey = mainModifierMap[row][col];
-          if (modifierKey != 0) {
-            keyToSend = modifierKey;
-          }
-        }
-        
-        // Check for special keys first (before ASCII check)
-        if (keyToSend == KEY_DELETE || keyToSend == KEY_HOME || keyToSend == KEY_BACKTICK || keyToSend == KEY_TILDE) {
-          // Special key - convert to HID keycode
-          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
-          if (hidKeycode != 0 && specialIndex < 6) {
-            specialKeys[specialIndex++] = hidKeycode;
-          }
-        } else if (keyToSend >= 0x20 && keyToSend <= 0x7E) {
-          // Regular ASCII character
-          keys[keyIndex++] = keyToSend;
-        } else {
-          // Other special key
-          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
-          if (hidKeycode != 0 && specialIndex < 6) {
-            specialKeys[specialIndex++] = hidKeycode;
-          }
-        }
-      }
+      keyDataForRPi.keys[row][col] = mainKeyStates[row][col];
     }
-    if (keyIndex >= 6) break;
   }
   
-  // Process thumb cluster (row 4)
-  if (keyIndex < 6 || specialIndex < 6) {
+  // Copy right side modifier states
+  keyDataForRPi.mods[0] = rightCtrlPressed;
+  keyDataForRPi.mods[1] = rightShiftPressed;
+  keyDataForRPi.mods[2] = rightAltPressed;
+  keyDataForRPi.mods[3] = rightSuperPressed;
+  keyDataForRPi.mods[4] = rightFnPressed;
+  
+  // Update timestamp
+  keyDataForRPi.timestamp = millis();
+  
+  // Send data to RPi as JSON string via BLE
+  if (pRPiCharacteristic != nullptr && rpiConnected) {
+    String jsonData = serializeKeyDataToJSON();
+    pRPiCharacteristic->writeValue(jsonData.c_str(), false);
+  }
+}
+
+// Serialize key data to JSON format for RPi
+String serializeKeyDataToJSON() {
+  String json = "{";
+  
+  // Keys matrix
+  json += "\"keys\":[";
+  for (int row = 0; row < MAIN_ROWS; row++) {
+    json += "[";
     for (int col = 0; col < MAIN_COLS; col++) {
-      if (keyIndex >= 6 && specialIndex >= 6) break;
-      
-      char key = mainKeyMap[4][col];
-      if (key == 0 || key == ' ') continue;
-      
-      if (mainKeyStates[4][col]) {
-        // Check if shift is pressed and use modifier map
-        // NOTE: This requires the left ESP32 to be connected and sending shift state
-        // via leftModifiers[1]. Until then, modifier map won't be applied.
-        char keyToSend = key;
-        if (leftModifiers[1]) { // Shift is pressed (from left ESP32)
-          char modifierKey = mainModifierMap[4][col];
-          if (modifierKey != 0 && modifierKey != KEY_DELETE && modifierKey != KEY_HOME && modifierKey != KEY_SPACE) {
-            keyToSend = modifierKey;
-          }
-        }
-        
-        // Check for special keys first (before ASCII check)
-        // Note: These constants may overlap with ASCII, so check them specifically
-        if (keyToSend == KEY_SPACE) {
-          // Space key - send as ASCII space character ' ' (0x20)
-          // BleKeyboard will handle the conversion to HID 0x2C
-          if (keyIndex < 6) keys[keyIndex++] = ' ';
-        } else if (keyToSend == KEY_DELETE || keyToSend == KEY_HOME || keyToSend == KEY_BACKTICK || keyToSend == KEY_TILDE) {
-          // Special key - convert to HID keycode
-          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
-          if (hidKeycode != 0 && specialIndex < 6) {
-            specialKeys[specialIndex++] = hidKeycode;
-          }
-        } else if (keyToSend >= 0x20 && keyToSend <= 0x7E) {
-          // Regular ASCII character
-          if (keyIndex < 6) keys[keyIndex++] = keyToSend;
-        } else {
-          // Other special key
-          uint8_t hidKeycode = asciiToHIDKeycode(keyToSend);
-          if (hidKeycode != 0 && specialIndex < 6) {
-            specialKeys[specialIndex++] = hidKeycode;
-          }
-        }
-      }
+      json += keyDataForRPi.keys[row][col] ? "1" : "0";
+      if (col < MAIN_COLS - 1) json += ",";
     }
+    json += "]";
+    if (row < MAIN_ROWS - 1) json += ",";
   }
+  json += "],";
   
-  // Check if anything changed
-  bool changed = (modifier != lastModifier);
-  if (!changed) {
-    for (int i = 0; i < 6; i++) {
-      if (keys[i] != lastKeys[i] || specialKeys[i] != lastSpecialKeys[i]) {
-        changed = true;
-        break;
-      }
-    }
+  // Modifiers
+  json += "\"mods\":[";
+  for (int i = 0; i < 5; i++) {
+    json += keyDataForRPi.mods[i] ? "1" : "0";
+    if (i < 4) json += ",";
   }
+  json += "],";
   
-  // Only send if changed
-  if (changed) {
-    // Release keys that are no longer pressed
-    for (int i = 0; i < 6; i++) {
-      if (lastKeys[i] != 0) {
-        // Check if this key is still in the current keys array
-        bool stillPressed = false;
-        for (int j = 0; j < 6; j++) {
-          if (keys[j] == lastKeys[i]) {
-            stillPressed = true;
-            break;
-          }
-        }
-        if (!stillPressed) {
-          // Key was released, release it
-          bleKeyboard.release(lastKeys[i]);
-        }
-      }
-    }
-    
-    // Release special keys that are no longer pressed
-    for (int i = 0; i < 6; i++) {
-      if (lastSpecialKeys[i] != 0) {
-        // Check if this key is still in the current specialKeys array
-        bool stillPressed = false;
-        for (int j = 0; j < 6; j++) {
-          if (specialKeys[j] == lastSpecialKeys[i]) {
-            stillPressed = true;
-            break;
-          }
-        }
-        if (!stillPressed) {
-          // Key was released, release it
-          bleKeyboard.release(lastSpecialKeys[i]);
-        }
-      }
-    }
-    
-    // Small delay to ensure releases are sent
-    delay(5);
-    
-    // Note: We DON'T manually set shift modifier here because:
-    // 1. For regular ASCII keys, BleKeyboard will automatically add shift for uppercase
-    // 2. For modifier map characters like '@' and '~', we want to send them directly
-    //    without shift modifier, as they're already the shifted characters
-    
-    // Press new keys that weren't previously pressed
-    for (int i = 0; i < 6; i++) {
-      if (keys[i] != 0) {
-        // Check if this key was already pressed
-        bool wasPressed = false;
-        for (int j = 0; j < 6; j++) {
-          if (lastKeys[j] == keys[i]) {
-            wasPressed = true;
-            break;
-          }
-        }
-        if (!wasPressed) {
-          // New key pressed
-          bleKeyboard.press(keys[i]);
-        }
-      }
-    }
-    
-    // Press new special keys that weren't previously pressed
-    for (int i = 0; i < 6; i++) {
-      if (specialKeys[i] != 0) {
-        // Check if this key was already pressed
-        bool wasPressed = false;
-        for (int j = 0; j < 6; j++) {
-          if (lastSpecialKeys[j] == specialKeys[i]) {
-            wasPressed = true;
-            break;
-          }
-        }
-        if (!wasPressed) {
-          // New key pressed
-          bleKeyboard.press(specialKeys[i]);
-        }
-      }
-    }
-    
-    // Debug output
-    static unsigned long lastDebugTime = 0;
-    if (millis() - lastDebugTime > 100) {
-      Serial.print("SENDING Keys: Mod=0x");
-      Serial.print(modifier, HEX);
-      Serial.print(" ASCII=[");
-      for (int i = 0; i < 6; i++) {
-        if (keys[i] != 0) {
-          Serial.print("'");
-          Serial.print((char)keys[i]);
-          Serial.print("' ");
-        }
-      }
-      Serial.print("] HID=[");
-      for (int i = 0; i < 6; i++) {
-        if (specialKeys[i] != 0) {
-          Serial.print("0x");
-          Serial.print(specialKeys[i], HEX);
-          Serial.print(" ");
-        }
-      }
-      Serial.println("]");
-      lastDebugTime = millis();
-    }
-    
-    // Save state
-    lastModifier = modifier;
-    memcpy(lastKeys, keys, 6);
-    memcpy(lastSpecialKeys, specialKeys, 6);
-  } else if (modifier == 0 && keys[0] == 0 && specialKeys[0] == 0) {
-    // No keys pressed - make sure we release everything
-    static unsigned long lastReleaseCheck = 0;
-    if (millis() - lastReleaseCheck > 100) {
-      // Check if we need to release (in case something got stuck)
-      if (lastModifier != 0 || lastKeys[0] != 0 || lastSpecialKeys[0] != 0) {
-        bleKeyboard.releaseAll();
-        lastModifier = 0;
-        memset(lastKeys, 0, 6);
-        memset(lastSpecialKeys, 0, 6);
-        Serial.println("Released all keys (idle state)");
-      }
-      lastReleaseCheck = millis();
-    }
-  }
+  // Timestamp
+  json += "\"ts\":";
+  json += String(keyDataForRPi.timestamp);
+  
+  json += "}";
+  return json;
 }
 
 // Get readable name for a key (especially for thumb keys)
@@ -742,24 +477,26 @@ String getKeyName(char key, int row, int col) {
 }
 
 // Convert ASCII character to HID keycode
+// Note: This function is kept for potential future use, but currently
+// we send raw key states to RPi which handles HID conversion
 uint8_t asciiToHIDKeycode(char key) {
-  // Handle special keys - use BleKeyboard library constants
+  // Handle special keys - HID keycode values
   // These checks must come BEFORE ASCII range checks since the constants
   // overlap with ASCII values
-  if (key == KEY_DELETE) return KEY_BACKSPACE; // Delete key sends backspace (0xB2)
-  if (key == KEY_HOME) return KEY_LEFT_GUI; // Home key sends Windows/GUI/Super key (0x83)
+  if (key == KEY_DELETE) return 0x2A; // Delete key sends backspace (HID 0x2A)
+  if (key == KEY_HOME) return 0x83; // Home key sends Windows/GUI/Super key (HID 0x83)
   if (key == KEY_SPACE) {
     // KEY_SPACE is 0xF2, but we need to send the actual space HID code
-    // Space ' ' (0x20) maps to 0x2C in HID, but we should pass ' ' to bleKeyboard
-    // So return 0 to indicate we should handle it as ASCII space instead
+    // Space ' ' (0x20) maps to 0x2C in HID
+    // Return 0 to indicate we should handle it as ASCII space instead
     return 0; // Will be handled as ASCII space character
   }
   if (key == KEY_BACKTICK) return 0x35; // Backtick/Grave (0x35 is correct)
   if (key == KEY_TILDE) return 0x35; // Tilde (same as backtick with shift)
   
   // Handle other special keys
-  if (key == 0x29) return KEY_ESC; // ESC using BleKeyboard constant
-  if (key == 0x2B) return KEY_TAB; // TAB using BleKeyboard constant
+  if (key == 0x29) return 0x29; // ESC (HID 0x29)
+  if (key == 0x2B) return 0x2B; // TAB (HID 0x2B)
   
   // Convert lowercase letters (a-z) to HID keycodes
   if (key >= 'a' && key <= 'z') {
@@ -798,56 +535,3 @@ uint8_t asciiToHIDKeycode(char key) {
   }
 }
 
-// Map left side main keys to appropriate characters
-char mapLeftSideKey(int row, int col) {
-  // Skip modifier keys (they're handled separately)
-  if ((row == 3 && col == 0) ||  // shift
-      (row == 2 && col == 0)) {  // super
-    return 0; // Don't send these as regular keys
-  }
-  
-  // Map other keys
-  switch (row) {
-    case 0: // Top row
-      switch (col) {
-        case 0: return 0x29; // ESC key (HID usage ID)
-        case 1: return '1';
-        case 2: return '2';
-        case 3: return '3';
-        case 4: return '4';
-        case 5: return '5';
-      }
-      break;
-    case 1: // Second row
-      switch (col) {
-        case 0: return 0x2B; // TAB key (HID usage ID)
-        case 1: return 'q';
-        case 2: return 'w';
-        case 3: return 'e';
-        case 4: return 'r';
-        case 5: return 't';
-      }
-      break;
-    case 2: // Third row
-      switch (col) {
-        case 0: return 0; // super key - handled as modifier
-        case 1: return 'a';
-        case 2: return 's';
-        case 3: return 'd';
-        case 4: return 'f';
-        case 5: return 'g';
-      }
-      break;
-    case 3: // Fourth row
-      switch (col) {
-        case 0: return 0; // shift key - handled as modifier
-        case 1: return 'z';
-        case 2: return 'x';
-        case 3: return 'c';
-        case 4: return 'v';
-        case 5: return 'b';
-      }
-      break;
-  }
-  return 0;
-}
