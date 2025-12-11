@@ -1,4 +1,5 @@
 # Split Keyboard Project
+# TODO: Update this
 
 A split keyboard design with Arduino Uno (left side) and ESP32 (right side) controllers, featuring thumb clusters and I2C communication.
 
@@ -26,25 +27,25 @@ Right Side (ESP32) - Main: 4×6 + Thumb: 1×5
 
 ## Hardware Requirements
 
-### Left Side (Arduino Uno)
-- Arduino Uno or compatible board
+### Left Side (Raspberry Pi)
+- Raspberry Pi or compatible board
 - 29 mechanical switches (24 main + 5 thumb)
 - 4×6 + 1×5 PCB or hand-wired matrix
-- USB cable for connection
+- Bluetooth connection to Host
 
 ### Right Side (ESP32)
 - ESP32 development board
 - 29 mechanical switches (24 main + 5 thumb)
 - 4×6 + 1×5 PCB or hand-wired matrix
 - Micro USB cable for programming
+- Bluetooth connection to Pi
 
 ### Communication
-- I2C connection between sides (SDA/SCL wires)
-- 3.3V power sharing (optional)
+- 5V power sharing (optional)
 
 ## Pin Configuration
 
-### Arduino Uno (Left Side)
+### Raspberry Pi (Left Side)
 - **Main Matrix Row Pins (Outputs):** 2, 3, 4, 5
 - **Main Matrix Column Pins (Inputs):** 6, 7, 8, 9, 10, 11
 - **Thumb Cluster Row Pin (Output):** 12
